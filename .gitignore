@@ -1,0 +1,22 @@
+# Internal docs — not for public repo
+detection_rules/
+reports/
+LAB_IOC_OBSERVATION_GUIDE.md
+LAB_RUN_GUIDE.md
+SOURCE_UNAVAILABLE.md
+
+# Compiled output — never commit the binary (Defender/GitHub will flag it)
+FunnyApp.exe
+*.obj
+*.pdb
+*.ilk
+*.exp
+*.lib
+!offreg.h
+
+# ADK library — too large and has MS licence; installed by lab_setup.ps1
+offreg.lib
+
+# Build noise
+*.log
+C:\Temp\
