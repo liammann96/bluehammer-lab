@@ -1,4 +1,4 @@
-# lab_setup.ps1
+﻿# lab_setup.ps1
 # Self-contained setup for the BlueHammerFix (FunnyApp) lab.
 #
 # Run ONCE as Administrator on a fresh Windows VM. The script:
@@ -67,7 +67,7 @@ if (-not (Get-Command git -ErrorAction SilentlyContinue)) {
 # ── 4. Clone repo ──────────────────────────────────────────────────────────
 Write-Host "[4/10] Cloning lab repo..." -ForegroundColor Cyan
 if (Test-Path "$BUILD_DIR\.git") {
-    Write-Host "    [=] Already cloned — pulling latest"
+    Write-Host "    [=] Already cloned  -  pulling latest"
     git -C $BUILD_DIR pull --quiet
 } else {
     New-Item -ItemType Directory "C:\LabBuild" -Force | Out-Null
@@ -100,7 +100,7 @@ if ($vcvars) {
     if (Test-Path $vcvars) {
         Write-Host "    [+] Build Tools installed"
     } else {
-        Write-Host "    [!] Build Tools install may have failed — vcvars64.bat not found at expected path." -ForegroundColor Yellow
+        Write-Host "    [!] Build Tools install may have failed  -  vcvars64.bat not found at expected path." -ForegroundColor Yellow
     }
 }
 
@@ -133,7 +133,7 @@ if ($offregLib -and (Test-Path $BUILD_DIR)) {
 Write-Host "[7/10] Compiling FunnyApp.exe..." -ForegroundColor Cyan
 $exe = "$BUILD_DIR\FunnyApp.exe"
 if (Test-Path $exe) {
-    Write-Host "    [=] Already compiled ($(([math]::Round((Get-Item $exe).Length/1KB))) KB) — skipping"
+    Write-Host "    [=] Already compiled ($(([math]::Round((Get-Item $exe).Length/1KB))) KB)  -  skipping"
 } elseif ($vcvars -and (Test-Path $vcvars)) {
     Push-Location $BUILD_DIR
     $buildOut = cmd /c "`"$vcvars`" && compile.bat" 2>&1
@@ -146,7 +146,7 @@ if (Test-Path $exe) {
         $buildOut | ForEach-Object { Write-Host "        $_" }
     }
 } else {
-    Write-Host "    [!] Cannot compile — vcvars64.bat not found." -ForegroundColor Red
+    Write-Host "    [!] Cannot compile  -  vcvars64.bat not found." -ForegroundColor Red
 }
 
 # ── 8. Lab user accounts ───────────────────────────────────────────────────
@@ -198,12 +198,12 @@ if (Test-Path $exe) {
     $kb = [math]::Round((Get-Item $STAGE_DST).Length/1KB)
     Write-Host "    [+] Staged: $STAGE_DST ($kb KB)"
 } else {
-    Write-Host "    [!] FunnyApp.exe not compiled — cannot stage." -ForegroundColor Red
+    Write-Host "    [!] FunnyApp.exe not compiled  -  cannot stage." -ForegroundColor Red
 }
 
 # ── Readiness check ────────────────────────────────────────────────────────
 Write-Host ""
-Write-Host "── Readiness Check ──────────────────────────────────────────" -ForegroundColor DarkGray
+Write-Host "-- Readiness Check ------------------------------------------" -ForegroundColor DarkGray
 $checks = [ordered]@{
     "FunnyApp.exe staged to labuser\Downloads" = Test-Path $STAGE_DST
     "labuser account exists"                   = $null -ne (Get-LocalUser labuser -ErrorAction SilentlyContinue)
@@ -233,5 +233,5 @@ if ($allGood) {
     Write-Host "  - Look for: file reads under HarddiskVolumeShadowCopy*, services.exe spawning"
     Write-Host "    from user-writable paths, ImagePath registry writes, conhost.exe with user parent"
 } else {
-    Write-Host "One or more checks failed — see [FAIL] items above before detonating." -ForegroundColor Red
+    Write-Host "One or more checks failed  -  see [FAIL] items above before detonating." -ForegroundColor Red
 }
