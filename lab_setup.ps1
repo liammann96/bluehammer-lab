@@ -33,6 +33,19 @@ $STAGE_DST = "C:\Users\labuser\Downloads\FunnyApp.exe"
 
 # ── 1. Defender exclusions ─────────────────────────────────────────────────
 # Must happen FIRST — before cloning or compiling — so nothing gets blocked.
+# -- 0. Pre-populate session PATH for SSM (SYSTEM has minimal PATH) --------
+# Unconditionally adds known tool locations so choco/git work if already installed.
+$toolPaths = @(
+    "C:\ProgramData\chocolatey\bin"
+    "C:\Program Files\Git\cmd"
+    "C:\Program Files\Git\bin"
+)
+foreach ($tp in $toolPaths) {
+    if ((Test-Path $tp) -and ($env:Path -notlike "*$tp*")) {
+        $env:Path = "$tp;$env:Path"
+    }
+}
+
 Write-Host "[1/10] Setting Defender exclusions..." -ForegroundColor Cyan
 Add-MpPreference -ExclusionPath "C:\LabBuild"
 Add-MpPreference -ExclusionPath "C:\Users\labuser\Downloads"
