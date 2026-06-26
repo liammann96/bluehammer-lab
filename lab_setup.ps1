@@ -5,7 +5,7 @@
 #   1. Sets Defender exclusions (before any downloads)
 #   2. Downloads the lab repo as a zip (no Git required)
 #   3. Installs VS 2022 Build Tools with C++ workload
-#   4. Installs Windows ADK Deployment Tools (for offreg.lib)
+#   4. Generates offreg.lib from C:\Windows\System32\offreg.dll (dumpbin + lib)
 #   5. Compiles FunnyApp.exe
 #   6. Creates labuser (standard) + labadmin (admin)
 #   7. Creates a VSS shadow copy (required - PoC silently exits without one)
@@ -22,8 +22,7 @@ $REPO_ZIP  = "https://github.com/liammann96/bluehammer-lab/archive/refs/heads/ma
 $BUILD_DIR = "C:\LabBuild\BlueHammerFix"
 $STAGE_DST = "C:\Users\labuser\Downloads\FunnyApp.exe"
 
-# -- 1. Defender exclusions -----------------------------------------------
-# Must happen FIRST so nothing gets quarantined during downloads/compile.
+# -- 1. Defender exclusions ---------------------------------------------------
 Write-Host "[1/8] Setting Defender exclusions..." -ForegroundColor Cyan
 Add-MpPreference -ExclusionPath "C:\LabBuild"
 Add-MpPreference -ExclusionPath "C:\Users\labuser\Downloads"
@@ -31,10 +30,10 @@ Add-MpPreference -ExclusionProcess "FunnyApp.exe"
 Add-MpPreference -ExclusionProcess "cl.exe"
 Write-Host "    [+] Exclusions set"
 
-# -- 2. Download repo ---------------------------------------------------------
+# -- 2. Download repo zip -----------------------------------------------------
 Write-Host "[2/8] Downloading lab repo..." -ForegroundColor Cyan
 if (Test-Path "$BUILD_DIR\FunnyApp.cpp") {
-    Write-Host "    [=] Repo already present - skipping download"
+    Write-Host "    [=] Repo already present - skipping"
 } else {
     New-Item -ItemType Directory "C:\LabBuild" -Force | Out-Null
     $zipPath = "C:\LabBuild\lab.zip"
@@ -42,8 +41,8 @@ if (Test-Path "$BUILD_DIR\FunnyApp.cpp") {
     Invoke-WebRequest -Uri $REPO_ZIP -OutFile $zipPath -UseBasicParsing
     Write-Host "    [*] Extracting..."
     Expand-Archive -Path $zipPath -DestinationPath "C:\LabBuild" -Force
-    # GitHub zips extract to <repo>-<branch>\ subfolder
-    $extracted = Get-ChildItem "C:\LabBuild" -Directory | Where-Object { $_.Name -like "bluehammer-lab-*" } | Select-Object -First 1
+    $extracted = Get-ChildItem "C:\LabBuild" -Directory |
+        Where-Object { $_.Name -like "bluehammer-lab-*" } | Select-Object -First 1
     if ($extracted) {
         if (Test-Path $BUILD_DIR) { Remove-Item $BUILD_DIR -Recurse -Force }
         Rename-Item $extracted.FullName $BUILD_DIR
@@ -84,31 +83,39 @@ if ($vcvars) {
     }
 }
 
-# -- 4. Windows ADK Deployment Tools (offreg.lib) ----------------------------
-Write-Host "[4/8] Checking offreg.lib (Windows ADK Deployment Tools)..." -ForegroundColor Cyan
-$offregLib = Get-ChildItem "C:\Program Files (x86)\Windows Kits\10\Lib" -Recurse -Filter "offreg.lib" -ErrorAction SilentlyContinue |
-    Where-Object { $_.FullName -like "*x64*" } | Select-Object -First 1
+# -- 4. Generate offreg.lib from offreg.dll -----------------------------------
+# offreg.dll ships with all Windows 10/Server 2016+ systems.
+# We generate the import library using dumpbin + lib (both part of VS Build Tools).
+# This avoids needing the Windows ADK entirely.
+Write-Host "[4/8] Generating offreg.lib from C:\Windows\System32\offreg.dll..." -ForegroundColor Cyan
+$offregLib = "$BUILD_DIR\offreg.lib"
 
-if ($offregLib) {
-    Write-Host "    [=] Found: $($offregLib.FullName)"
-} else {
-    Write-Host "    [*] Downloading Windows ADK web installer..."
-    $adkSetup = "C:\LabBuild\adksetup.exe"
-    Invoke-WebRequest -Uri "https://go.microsoft.com/fwlink/?linkid=2196127" -OutFile $adkSetup -UseBasicParsing
-    Write-Host "    [*] Installing Deployment Tools only (~5 min)..."
-    Start-Process -FilePath $adkSetup -ArgumentList "/quiet /features OptionId.DeploymentTools" -Wait
-    $offregLib = Get-ChildItem "C:\Program Files (x86)\Windows Kits\10\Lib" -Recurse -Filter "offreg.lib" -ErrorAction SilentlyContinue |
-        Where-Object { $_.FullName -like "*x64*" } | Select-Object -First 1
-    if ($offregLib) {
-        Write-Host "    [+] ADK installed, offreg.lib at: $($offregLib.FullName)"
-    } else {
-        Write-Host "    [!] Could not find offreg.lib after ADK install." -ForegroundColor Yellow
+if (Test-Path $offregLib) {
+    Write-Host "    [=] offreg.lib already present"
+} elseif ($vcvars -and (Test-Path $vcvars)) {
+    $dumpOut = cmd /c "`"$vcvars`" && dumpbin /exports C:\Windows\System32\offreg.dll" 2>&1
+    $names = $dumpOut | ForEach-Object {
+        if ($_ -match '^\s+\d+\s+[0-9a-fA-F]+\s+[0-9a-fA-F]+\s+(\w+)\s*$') { $Matches[1] }
     }
-}
-
-if ($offregLib -and (Test-Path $BUILD_DIR)) {
-    Copy-Item $offregLib.FullName "$BUILD_DIR\offreg.lib" -Force
-    Write-Host "    [+] offreg.lib copied to $BUILD_DIR"
+    if ($names.Count -eq 0) {
+        Write-Host "    [!] Could not parse offreg.dll exports" -ForegroundColor Red
+        $dumpOut | Select-Object -First 10 | ForEach-Object { Write-Host "        $_" }
+    } else {
+        Write-Host "    [*] Found $($names.Count) exports in offreg.dll"
+        $defPath = "$BUILD_DIR\offreg.def"
+        $defLines = @('LIBRARY "offreg.dll"', 'EXPORTS') + ($names | ForEach-Object { "    $_" })
+        [IO.File]::WriteAllLines($defPath, $defLines, [Text.Encoding]::ASCII)
+        $libOut = cmd /c "`"$vcvars`" && lib /def:`"$defPath`" /machine:x64 /out:`"$offregLib`" /nologo" 2>&1
+        if (Test-Path $offregLib) {
+            $kb = [math]::Round((Get-Item $offregLib).Length / 1KB)
+            Write-Host "    [+] offreg.lib generated ($kb KB)"
+        } else {
+            Write-Host "    [!] lib.exe failed:" -ForegroundColor Red
+            $libOut | ForEach-Object { Write-Host "        $_" }
+        }
+    }
+} else {
+    Write-Host "    [!] Cannot generate offreg.lib - vcvars64.bat not found" -ForegroundColor Red
 }
 
 # -- 5. Compile FunnyApp.exe --------------------------------------------------
@@ -133,11 +140,13 @@ if (Test-Path $exe) {
 }
 
 # -- 6. Lab user accounts -----------------------------------------------------
+# Passwords must not contain any 3+ char substring of the username (Windows policy).
+# 'Winter!2026#Zx' contains no substring of 'labuser' or 'labadmin'.
 Write-Host "[6/8] Creating lab user accounts..." -ForegroundColor Cyan
 
 if (-not (Get-LocalUser labuser -ErrorAction SilentlyContinue)) {
-    $pw = ConvertTo-SecureString "LabBH2026!NCSC#" -AsPlainText -Force
-    New-LocalUser -Name labuser -Password $pw -FullName "Lab Standard User" -PasswordNeverExpires
+    $pw = ConvertTo-SecureString 'Winter!2026#Zx' -AsPlainText -Force
+    New-LocalUser -Name labuser -Password $pw -PasswordNeverExpires
     Add-LocalGroupMember -Group "Users" -Member labuser
     Write-Host "    [+] labuser created"
 } else {
@@ -145,8 +154,8 @@ if (-not (Get-LocalUser labuser -ErrorAction SilentlyContinue)) {
 }
 
 if (-not (Get-LocalUser labadmin -ErrorAction SilentlyContinue)) {
-    $pw = ConvertTo-SecureString "AdminBH2026!NCSC#" -AsPlainText -Force
-    New-LocalUser -Name labadmin -Password $pw -FullName "Lab Admin User" -PasswordNeverExpires
+    $pw = ConvertTo-SecureString 'Winter!2026#Zx' -AsPlainText -Force
+    New-LocalUser -Name labadmin -Password $pw -PasswordNeverExpires
     Add-LocalGroupMember -Group "Administrators" -Member labadmin
     Write-Host "    [+] labadmin created"
 } else {
@@ -158,8 +167,6 @@ Write-Host "    [+] labuser added to Remote Desktop Users"
 
 # -- 7. VSS shadow copy -------------------------------------------------------
 Write-Host "[7/8] Creating VSS shadow copy..." -ForegroundColor Cyan
-# Critical: FunnyApp enumerates existing VSS shadows to find hive copies.
-# On a fresh VM there are none - without at least one the exploit exits silently.
 $hasShadow = (vssadmin list shadows 2>&1) -match "Shadow Copy Volume"
 if ($hasShadow) {
     Write-Host "    [=] Shadow copy already exists"
