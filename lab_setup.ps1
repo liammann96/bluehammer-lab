@@ -46,8 +46,10 @@ if (-not (Get-Command choco -ErrorAction SilentlyContinue)) {
     Write-Host "    [*] Installing Chocolatey..."
     [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
     Invoke-Expression ((New-Object Net.WebClient).DownloadString('https://community.chocolatey.org/install.ps1'))
-    Import-Module "$env:ChocolateyInstall\helpers\chocolateyProfile.psm1" -ErrorAction SilentlyContinue
-    refreshenv
+    # Add Chocolatey bin to current-session PATH (new-process env not inherited)
+    if (-not $env:ChocolateyInstall) { $env:ChocolateyInstall = "C:\ProgramData\chocolatey" }
+    $chocoBin = "$env:ChocolateyInstall\bin"
+    if ($env:Path -notlike "*$chocoBin*") { $env:Path = "$chocoBin;$env:Path" }
     Write-Host "    [+] Chocolatey installed"
 } else {
     Write-Host "    [=] Chocolatey already present"
