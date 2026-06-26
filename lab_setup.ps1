@@ -26,7 +26,12 @@ $STAGE_DST = "C:\Users\labuser\Downloads\FunnyApp.exe"
 Write-Host "[1/8] Setting Defender exclusions..." -ForegroundColor Cyan
 Add-MpPreference -ExclusionPath "C:\LabBuild"
 Add-MpPreference -ExclusionPath "C:\Users\labuser\Downloads"
-Add-MpPreference -ExclusionProcess "FunnyApp.exe"
+# ExclusionProcess for FunnyApp.exe intentionally REMOVED.
+# A process exclusion suppresses scanning of files FunnyApp opens/creates,
+# including the EICAR file in %TEMP% that triggers the VSS oplock chain.
+# Use ExclusionPath on the binary so Defender won't quarantine it but still
+# scans its file operations (required for TriggerWDForVS to work).
+Add-MpPreference -ExclusionPath "C:\Users\labuser\Downloads\FunnyApp.exe"
 Add-MpPreference -ExclusionProcess "cl.exe"
 Write-Host "    [+] Exclusions set"
 
