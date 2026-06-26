@@ -21,7 +21,9 @@
 #   Set-ExecutionPolicy Bypass -Scope Process -Force
 #   .\lab_setup.ps1
 
-#Requires -RunAsAdministrator
+# Note: #Requires -RunAsAdministrator omitted intentionally so the script can
+# run via SSM (which executes as NT AUTHORITY\SYSTEM, not a named admin user).
+# The script requires elevation — run from an elevated prompt or SSM.
 
 $ErrorActionPreference = "Continue"
 
