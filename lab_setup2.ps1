@@ -245,7 +245,7 @@ if (-not $toolchainHealthy) {
         "--norestart",
         "--nocache",
         "--channelUri", "https://aka.ms/vs/17/release.LTSC.17.12/channel",
-        "-add", "Microsoft.VisualStudio.Workload.VCTools",
+        "--add", "Microsoft.VisualStudio.Workload.VCTools",
         "--includeRecommended",
         "--log", "C:\LabBuild\vs_install.log"
     )
