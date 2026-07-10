@@ -244,11 +244,10 @@ if (-not $toolchainHealthy) {
         "--wait",
         "--norestart",
         "--nocache",
-        "--add Microsoft.VisualStudio.Workload.VCTools",
-        "--includeRecommended",
-        "--add Microsoft.VisualStudio.Component.VC.Tools.x86.x64",
-        "--add Microsoft.VisualStudio.Component.Windows11SDK.22621",
-        "--log C:\LabBuild\vs_install.log"
+        "--channelUri", "https://aka.ms/vs/17/release.LTSC.17.12/channel",
+				"-add", "Microsoft.VisualStudio.Workload.VCTools",
+				"--includeRecommended",
+				"--log", "C:\LabBuild\vs_install.log"
     )
 
 
