@@ -219,11 +219,28 @@ if (-not $toolchainHealthy) {
         "--log", $installLog
     )
 
-    $installProc = Start-Process `
-        -FilePath $btInstaller `
-        -ArgumentList $btArgs `
-        -Wait `
-        -PassThru
+    try {
+        $installProc = Start-Process `
+            -FilePath $btInstaller `
+            -ArgumentList $btArgs `
+            -NoNewWindow `
+            -Wait `
+            -PassThru `
+            -ErrorAction Stop
+    }
+    catch {
+        Write-Host "    [!] Failed to launch vs_buildtools.exe: $($_.Exception.Message)" -ForegroundColor Red
+
+        if ($_.Exception.Message -match "87|parameter is incorrect") {
+            Write-Host "        Error 87 with no install log usually means the process never launched -" -ForegroundColor Yellow
+            Write-Host "        typically because this session has no window station (e.g. running via" -ForegroundColor Yellow
+            Write-Host "        SSM Run Command / EC2 UserData as SYSTEM in Session 0). This script now" -ForegroundColor Yellow
+            Write-Host "        passes -NoNewWindow to avoid that; if you still see this, try running" -ForegroundColor Yellow
+            Write-Host "        interactively via RDP instead." -ForegroundColor Yellow
+        }
+
+        exit 1
+    }
 
     Write-Host "    [*] Bootstrapper exited with code: $($installProc.ExitCode)"
 
