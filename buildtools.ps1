@@ -219,34 +219,56 @@ if (-not $toolchainHealthy) {
         "--log", $installLog
     )
 
-    try {
-        $installProc = Start-Process `
-            -FilePath $btInstaller `
-            -ArgumentList $btArgs `
-            -NoNewWindow `
-            -Wait `
-            -PassThru `
-            -ErrorAction Stop
-    }
-    catch {
-        Write-Host "    [!] Failed to launch vs_buildtools.exe: $($_.Exception.Message)" -ForegroundColor Red
+    # -- Launch via Scheduled Task, not Start-Process -------------------------
+    # Running under SSM Run Command means this whole script executes as SYSTEM
+    # in Session 0, which has no window station attached. vs_buildtools.exe
+    # needs one even in --quiet mode (it initializes hidden UI/COM on startup)
+    # and fails immediately with error 87 and zero logs if it can't get one -
+    # no Start-Process flag works around this, since the restriction lives in
+    # the child process's own session, not in how the parent launches it.
+    # A Scheduled Task gets its own execution context that has a usable
+    # window station, so we register one, run it, poll, then clean up.
 
-        if ($_.Exception.Message -match "87|parameter is incorrect") {
-            Write-Host "        Error 87 with no install log usually means the process never launched -" -ForegroundColor Yellow
-            Write-Host "        typically because this session has no window station (e.g. running via" -ForegroundColor Yellow
-            Write-Host "        SSM Run Command / EC2 UserData as SYSTEM in Session 0). This script now" -ForegroundColor Yellow
-            Write-Host "        passes -NoNewWindow to avoid that; if you still see this, try running" -ForegroundColor Yellow
-            Write-Host "        interactively via RDP instead." -ForegroundColor Yellow
-        }
+    $taskName = "BlueHammerLab_VSBuildToolsInstall"
+    $argString = ($btArgs | ForEach-Object {
+        if ($_ -match '\s') { '"{0}"' -f $_ } else { $_ }
+    }) -join " "
 
-        exit 1
-    }
+    Write-Host "    [*] Registering scheduled task to run installer with an interactive window station..."
 
-    Write-Host "    [*] Bootstrapper exited with code: $($installProc.ExitCode)"
+    $action  = New-ScheduledTaskAction -Execute $btInstaller -Argument $argString
+    $principal = New-ScheduledTaskPrincipal -UserId "SYSTEM" -LogonType ServiceAccount -RunLevel Highest
+    $settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -ExecutionTimeLimit (New-TimeSpan -Hours 1)
 
-    if ($installProc.ExitCode -notin @(0,3010)) {
+    Unregister-ScheduledTask -TaskName $taskName -Confirm:$false -ErrorAction SilentlyContinue
 
-        Write-Host "    [!] Bootstrapper returned failure exit code $($installProc.ExitCode)" -ForegroundColor Red
+    Register-ScheduledTask -TaskName $taskName -Action $action -Principal $principal -Settings $settings | Out-Null
+
+    Start-ScheduledTask -TaskName $taskName
+
+    Write-Host "    [*] Waiting for installer task to complete..."
+
+    # Give it a moment to actually start before polling for "Ready" state,
+    # otherwise we might catch it between "Register" and "Running".
+    Start-Sleep -Seconds 5
+
+    do {
+        Start-Sleep -Seconds 15
+        $taskInfo = Get-ScheduledTask -TaskName $taskName | Get-ScheduledTaskInfo
+        Write-Host "        ... still running (state check every 15s)"
+    } while ($taskInfo.LastTaskResult -eq 267009)  # 267009 = SCHED_S_TASK_RUNNING
+
+    $exitCode = $taskInfo.LastTaskResult
+
+    Unregister-ScheduledTask -TaskName $taskName -Confirm:$false -ErrorAction SilentlyContinue
+
+    Write-Host "    [*] Installer task finished with result: $exitCode (0x$('{0:X}' -f $exitCode))"
+
+    $installProc = [PSCustomObject]@{ ExitCode = $exitCode }
+
+    if ($exitCode -notin @(0,3010)) {
+
+        Write-Host "    [!] Installer task returned failure code $exitCode" -ForegroundColor Red
 
         # Surface the actual reason instead of limping forward blind.
         $summaryLog = Get-ChildItem "C:\LabBuild\*_Setup.log*" -ErrorAction SilentlyContinue |
