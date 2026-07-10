@@ -117,6 +117,39 @@ if (-not $toolchainHealthy) {
 
     New-Item -ItemType Directory "C:\LabBuild" -Force | Out-Null
 
+    # -- Detect machine and pick matching components --------------------------
+    # Rather than hardcoding an SDK/channel that happened to work on one box,
+    # inspect the actual OS build and CPU arch and choose accordingly. This is
+    # what caused the original C1083 (Windows11SDK.22621 doesn't ship on
+    # Server 2022) - build number tells us which SDK actually exists for it.
+
+    $os = Get-CimInstance Win32_OperatingSystem
+    $buildNumber = [int]$os.BuildNumber
+    $arch = $env:PROCESSOR_ARCHITECTURE
+
+    Write-Host "    [*] Detected OS: $($os.Caption) (build $buildNumber, $arch)"
+
+    # Known-good Windows SDK component per OS build. Extend this table as new
+    # Windows/Server releases ship - Microsoft doesn't expose this mapping via
+    # an API, so it has to be maintained by hand.
+    $sdkComponent = switch ($buildNumber) {
+        { $_ -ge 26100 } { "Microsoft.VisualStudio.Component.Windows11SDK.26100"; break }  # Server 2025 / Win11 24H2
+        { $_ -ge 22621 } { "Microsoft.VisualStudio.Component.Windows11SDK.22621"; break }  # Win11 22H2/23H2
+        { $_ -ge 20348 } { "Microsoft.VisualStudio.Component.Windows10SDK.20348"; break }  # Server 2022
+        { $_ -ge 17763 } { "Microsoft.VisualStudio.Component.Windows10SDK.17763"; break }  # Server 2019
+        default          { "Microsoft.VisualStudio.Component.Windows10SDK.19041" }         # fallback, broadly available
+    }
+
+    Write-Host "    [+] Selected SDK component: $sdkComponent"
+
+    $vcToolsComponent = if ($arch -eq "ARM64") {
+        "Microsoft.VisualStudio.Component.VC.Tools.ARM64"
+    } else {
+        "Microsoft.VisualStudio.Component.VC.Tools.x86.x64"
+    }
+
+    Write-Host "    [+] Selected VC Tools component: $vcToolsComponent"
+
     # -- Preflight: disk space -----------------------------------------------
     # VS Build Tools + C++ workload wants ~6-8GB free. EC2 Windows Server AMIs
     # often ship with a small (30GB) C: volume, so check before burning 15+ min.
@@ -132,17 +165,17 @@ if (-not $toolchainHealthy) {
     }
 
     # -- Download bootstrapper -----------------------------------------------
-    # IMPORTANT: the bootstrapper build and the --channelUri passed to it must
-    # match. Downloading the "Current channel" bootstrapper (release/) but
-    # installing against a pinned LTSC channel causes the installer to fail
-    # with "A product matching the following parameters cannot be found" and
-    # exit non-zero - which silently leaves vcvars64.bat missing. Pin both to
-    # the same channel here.
+    # Use the Current channel consistently for both the bootstrapper and the
+    # channelUri it's told to install from. Pinning to a specific LTSC point
+    # release (e.g. 17.12) requires that exact version to still exist at that
+    # URL - Microsoft moves these forward and stale pins start returning
+    # mismatched products. The generic "release" alias is Microsoft's
+    # supported "give me a working current bootstrapper" endpoint.
 
-    $channelUri      = "https://aka.ms/vs/17/release.LTSC.17.12/channel"
-    $bootstrapperUri = "https://aka.ms/vs/17/release.LTSC.17.12/vs_buildtools.exe"
+    $channelUri      = "https://aka.ms/vs/17/release/channel"
+    $bootstrapperUri = "https://aka.ms/vs/17/release/vs_buildtools.exe"
 
-    Write-Host "    [*] Downloading VS 2022 Build Tools bootstrapper (LTSC 17.12)..."
+    Write-Host "    [*] Downloading VS 2022 Build Tools bootstrapper (Current channel)..."
 
     $btInstaller = "C:\LabBuild\vs_buildtools.exe"
 
@@ -160,7 +193,16 @@ if (-not $toolchainHealthy) {
         exit 1
     }
 
-    Write-Host "    [*] Installing C++ workload (10-20 min)..."
+    # Sanity-check we actually got the installer, not an HTML error page
+    # (happens if aka.ms redirect chain gets blocked/proxied unexpectedly).
+    $sig = Get-AuthenticodeSignature $btInstaller
+    if ($sig.Status -ne "Valid") {
+        Write-Host "    [!] Downloaded file failed signature check (status: $($sig.Status))." -ForegroundColor Red
+        Write-Host "        This usually means a proxy/firewall intercepted the download. Aborting." -ForegroundColor Yellow
+        exit 1
+    }
+
+    Write-Host "    [*] Installing C++ workload for detected build $buildNumber / $arch (10-20 min)..."
 
     $installLog = "C:\LabBuild\vs_install.log"
 
@@ -170,7 +212,9 @@ if (-not $toolchainHealthy) {
         "--norestart",
         "--nocache",
         "--channelUri", $channelUri,
-        "--add", "Microsoft.VisualStudio.Workload.VCTools",
+        "--add", $vcToolsComponent,
+        "--add", $sdkComponent,
+        "--add", "Microsoft.VisualStudio.Component.VC.CoreBuildTools",
         "--includeRecommended",
         "--log", $installLog
     )
