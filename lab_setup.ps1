@@ -66,7 +66,7 @@ $vcvars = @(
     "C:\Program Files\Microsoft Visual Studio\2022\Community\VC\Auxiliary\Build\vcvars64.bat"
     "C:\Program Files\Microsoft Visual Studio\2022\Professional\VC\Auxiliary\Build\vcvars64.bat"
     "C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Auxiliary\Build\vcvars64.bat"
-	"C:\Program\VC\Auxiliary\Build\vcvars.64.bat"
+	"C:\Program\VC\Auxiliary\Build\vcvars64.bat"
 ) | Where-Object { Test-Path $_ } | Select-Object -First 1
 
 if ($vcvars) {
