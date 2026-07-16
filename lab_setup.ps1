@@ -1,4 +1,4 @@
-﻿# lab_setup.ps1
+# lab_setup.ps1
 # Self-contained setup for the BlueHammerFix (FunnyApp) lab.
 #
 # Run ONCE as Administrator on a fresh Windows VM. The script:
@@ -66,6 +66,7 @@ $vcvars = @(
     "C:\Program Files\Microsoft Visual Studio\2022\Community\VC\Auxiliary\Build\vcvars64.bat"
     "C:\Program Files\Microsoft Visual Studio\2022\Professional\VC\Auxiliary\Build\vcvars64.bat"
     "C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Auxiliary\Build\vcvars64.bat"
+		"C:\Program\VC\Auxiliary\Build\vcvars.64.bat"
 ) | Where-Object { Test-Path $_ } | Select-Object -First 1
 
 if ($vcvars) {
